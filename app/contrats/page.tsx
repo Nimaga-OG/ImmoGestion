@@ -41,6 +41,7 @@ export default function ContractsPage() {
   const [units, setUnits] = useState<Unit[]>([])
   const [tenants, setTenants] = useState<Tenant[]>([])
   const [loading, setLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<{ id: string } | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const [selectedContract, setSelectedContract] = useState<Contract | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -57,42 +58,28 @@ export default function ContractsPage() {
   const loadData = useCallback(async () => {
     setLoading(true)
     const { data: { user } } = await supabase.auth.getUser()
-    if (!user) return
+    if (!user) {
+      setLoading(false)
+      return
+    }
+    setCurrentUser(user)
 
-    // Charger les contrats avec unités
-    const { data: contractsData } = await supabase
-      .from('contracts')
-      .select('*, properties(name, address), tenants(first_name, last_name), units(name, type)')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
+    const [
+      { data: contractsData },
+      { data: propertiesData },
+      { data: unitsData },
+      { data: tenantsData }
+    ] = await Promise.all([
+      supabase.from('contracts').select('*, properties(name, address), tenants(first_name, last_name), units(name, type)').eq('user_id', user.id).order('created_at', { ascending: false }),
+      supabase.from('properties').select('*').eq('user_id', user.id),
+      supabase.from('units').select('*').eq('user_id', user.id).in('status', ['available', 'occupied']),
+      supabase.from('tenants').select('*').eq('user_id', user.id)
+    ])
 
     if (contractsData) setContracts(contractsData)
-
-    // Charger les propriétés
-    const { data: propertiesData } = await supabase
-      .from('properties')
-      .select('*')
-      .eq('user_id', user.id)
-
     if (propertiesData) setProperties(propertiesData)
-
-    // Charger les unités disponibles
-    const { data: unitsData } = await supabase
-      .from('units')
-      .select('*')
-      .eq('user_id', user.id)
-      .in('status', ['available', 'occupied'])
-
     if (unitsData) setUnits(unitsData)
-
-    // Charger les locataires
-    const { data: tenantsData } = await supabase
-      .from('tenants')
-      .select('*')
-      .eq('user_id', user.id)
-
     if (tenantsData) setTenants(tenantsData)
-
     setLoading(false)
   }, [])
 
@@ -102,7 +89,7 @@ export default function ContractsPage() {
   }, [loadData])
 
   const handleAddContract = async (formData: ContractFormData) => {
-    const { data: { user } } = await supabase.auth.getUser()
+    const user = currentUser
     if (!user) return
 
     const { error } = await supabase

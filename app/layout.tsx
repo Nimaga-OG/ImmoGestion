@@ -2,9 +2,9 @@
 import type { Metadata } from 'next'
 import { Inter } from 'next/font/google'
 import './globals.css'
-import { Sidebar } from '@/components/ui/Sidebar'
+import LayoutShell from '@/components/ui/LayoutShell'
 
-const inter = Inter({ 
+const inter = Inter({
   subsets: ['latin'],
   display: 'swap',
 })
@@ -22,12 +22,9 @@ export default function RootLayout({
   return (
     <html lang="fr">
       <body className={`${inter.className} bg-gradient-to-br from-gray-50 to-blue-50 min-h-screen`}>
-        <div className="flex">
-          <Sidebar />
-          <main className="ml-64 flex-1 p-8">
-            {children}
-          </main>
-        </div>
+        <LayoutShell>
+          {children}
+        </LayoutShell>
       </body>
     </html>
   )

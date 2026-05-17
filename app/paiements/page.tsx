@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState, startTransition } from 'react'
 import { supabase } from '@/lib/supabase'
 import { GlassCard } from '@/components/ui/GlassCard'
 import { Button } from '@/components/ui/Button'
@@ -14,8 +14,6 @@ import {
   DollarSign, CreditCard, AlertCircle, CheckCircle2,
   Clock, Calendar, Search, Trash2, Edit, FileText, Printer, X
 } from 'lucide-react'
-import { useReceiptGenerator } from '@/hooks/useReceiptGenerator'
-import { utils, writeFile } from 'xlsx'
 import { format } from 'date-fns'
 import { fr } from 'date-fns/locale'
 import type { Payment, Contract, Tenant, Property, Unit } from '@/lib/database.types'
@@ -28,8 +26,8 @@ type PaymentWithRelations = Payment & {
 export default function PaymentsPage() {
   const [payments, setPayments] = useState<PaymentWithRelations[]>([])
   const [contracts, setContracts] = useState<(Contract & { properties?: Property; tenants?: Tenant; units?: Unit })[]>([])
-  const { downloadReceipt } = useReceiptGenerator()
   const [loading, setLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<{ id: string; email?: string; user_metadata?: any } | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [selectedPayment, setSelectedPayment] = useState<Payment | null>(null)
@@ -52,8 +50,7 @@ export default function PaymentsPage() {
     const now = new Date()
     const currentMonth = now.getMonth()
     const currentYear = now.getFullYear()
-
-    setStats({
+    return {
       totalRevenue: data.filter(p => p.status === 'paid').reduce((sum, p) => sum + p.amount, 0),
       expectedRevenue: data.filter(p => p.status === 'pending').reduce((sum, p) => sum + p.amount, 0),
       latePayments: data.filter(p => p.status === 'late').length,
@@ -63,42 +60,56 @@ export default function PaymentsPage() {
                paymentDate.getFullYear() === currentYear &&
                p.status === 'paid'
       }).reduce((sum, p) => sum + p.amount, 0)
-    })
+    }
   }
-
-  const loadData = useCallback(async () => {
-    setLoading(true)
+  // Fetcher qui renvoie les résultats mais ne met pas l'état directement.
+  const fetchFromServer = async () => {
     const { data: { user } } = await supabase.auth.getUser()
-    if (!user) { setLoading(false); return }
+    if (!user) return { user: null, payments: [], contracts: [] }
 
-    let query = supabase
+    const paymentsQuery = supabase
       .from('payments')
       .select('*, tenants(first_name, last_name, email, phone), contracts(monthly_rent, property_id, properties(name, address, type), units(name, type))')
       .eq('user_id', user.id)
       .order('date', { ascending: false })
 
-    if (filterStatus !== 'all') query = query.eq('status', filterStatus)
+    if (filterStatus !== 'all') paymentsQuery.eq('status', filterStatus)
 
-    const { data: paymentsData } = await query
-    if (paymentsData) {
-      setPayments(paymentsData)
-      calculateStats(paymentsData)
-    }
-
-    const { data: contractsData } = await supabase
+    const contractsQuery = supabase
       .from('contracts')
       .select('*, properties(name, address, type), tenants(first_name, last_name)')
       .eq('user_id', user.id)
       .eq('status', 'active')
 
-    if (contractsData) setContracts(contractsData)
-    setLoading(false)
-  }, [filterStatus])
+    const [paymentsResult, contractsResult] = await Promise.all([paymentsQuery, contractsQuery])
 
-  useEffect(() => { void loadData() }, [loadData])
+    return {
+      user,
+      payments: paymentsResult.data || [],
+      contracts: contractsResult.data || []
+    }
+  }
+
+  // Fonction publique pour recharger les données (utilisée par les handlers)
+  const reloadData = async () => {
+    setLoading(true)
+    const res = await fetchFromServer()
+    if (!res.user) { setLoading(false); return }
+    const computedStats = calculateStats(res.payments as Payment[])
+    // grouper les mises à jour d'état dans une transition pour éviter des re-render en cascade
+    startTransition(() => {
+      setCurrentUser(res.user)
+      setPayments(res.payments as PaymentWithRelations[])
+      setContracts(res.contracts as typeof contracts)
+      setStats(computedStats)
+      setLoading(false)
+    })
+  }
+
+  useEffect(() => { void reloadData() }, [filterStatus])
 
   const handleAddPayment = async (formData: PaymentFormData) => {
-    const { data: { user } } = await supabase.auth.getUser()
+    const user = currentUser
     if (!user) { setToast({ message: 'Non authentifié', type: 'error' }); return }
 
     const contract = contracts.find(c => c.id === formData.contract_id)
@@ -108,6 +119,12 @@ export default function PaymentsPage() {
     const paymentsToCreate = []
     const startDate = new Date(formData.due_date)
 
+    const { data: existingPayments } = await supabase
+      .from('payments')
+      .select('*, contracts(property_id)')
+      .eq('tenant_id', formData.tenant_id)
+      .eq('user_id', user.id)
+
     // Générer les paiements pour chaque mois
     for (let i = 0; i < monthsToPay; i++) {
       const dueDate = new Date(startDate)
@@ -116,29 +133,20 @@ export default function PaymentsPage() {
       const paymentMonth = dueDate.getMonth()
       const paymentYear = dueDate.getFullYear()
 
-      // Vérifier si un paiement existe déjà pour ce mois
-      const { data: existingPayments } = await supabase
-        .from('payments')
-        .select('*, contracts(property_id)')
-        .eq('tenant_id', formData.tenant_id)
-        .eq('user_id', user.id)
+      const hasDuplicate = existingPayments?.some(payment => {
+        const existingDate = new Date(payment.due_date)
+        const existingMonth = existingDate.getMonth()
+        const existingYear = existingDate.getFullYear()
+        const existingPropertyId = payment.contracts?.property_id
 
-      if (existingPayments) {
-        const hasDuplicate = existingPayments.some(payment => {
-          const existingDate = new Date(payment.due_date)
-          const existingMonth = existingDate.getMonth()
-          const existingYear = existingDate.getFullYear()
-          const existingPropertyId = payment.contracts?.property_id
+        return existingMonth === paymentMonth &&
+               existingYear === paymentYear &&
+               existingPropertyId === contract.property_id
+      })
 
-          return existingMonth === paymentMonth &&
-                 existingYear === paymentYear &&
-                 existingPropertyId === contract.property_id
-        })
-
-        if (hasDuplicate) {
-          setToast({ message: `Un paiement existe déjà pour ${dueDate.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}`, type: 'error' })
-          return
-        }
+      if (hasDuplicate) {
+        setToast({ message: `Un paiement existe déjà pour ${dueDate.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}`, type: 'error' })
+        return
       }
 
       paymentsToCreate.push({
@@ -164,7 +172,7 @@ export default function PaymentsPage() {
     } else {
       setToast({ message: `${monthsToPay} paiement${monthsToPay > 1 ? 's' : ''} enregistré${monthsToPay > 1 ? 's' : ''} avec succès`, type: 'success' })
       setShowAddModal(false)
-      loadData()
+      await reloadData()
     }
   }
 
@@ -177,7 +185,7 @@ export default function PaymentsPage() {
       setToast({ message: 'Paiement modifié avec succès', type: 'success' })
       setShowEditModal(false)
       setSelectedPayment(null)
-      loadData()
+      await reloadData()
     }
   }
 
@@ -190,11 +198,11 @@ export default function PaymentsPage() {
       setToast({ message: 'Paiement supprimé avec succès', type: 'success' })
       setShowDeleteConfirm(false)
       setPaymentToDelete(null)
-      loadData()
+      await reloadData()
     }
   }
 
-  const handleExport = (exportFormat: 'csv' | 'excel' = 'csv') => {
+  const handleExport = async (exportFormat: 'csv' | 'excel' = 'csv') => {
     if (payments.length === 0) { setToast({ message: 'Aucune donnée à exporter', type: 'warning' }); return }
     
     const exportData = payments.map(payment => ({
@@ -218,6 +226,7 @@ export default function PaymentsPage() {
       link.click()
       setToast({ message: 'Export CSV réussi !', type: 'success' })
     } else {
+      const { utils, writeFile } = await import('xlsx')
       const ws = utils.json_to_sheet(exportData)
       const wb = utils.book_new()
       utils.book_append_sheet(wb, ws, 'Paiements')
@@ -245,7 +254,7 @@ export default function PaymentsPage() {
   }
 
   const handlePrintReceipt = async (payment: PaymentWithRelations) => {
-    const { data: { user } } = await supabase.auth.getUser()
+    const user = currentUser
     if (!user) return
 
     // Récupérer tous les paiements avec la même référence pour afficher les mois multiples
@@ -258,8 +267,10 @@ export default function PaymentsPage() {
 
     const isMultiplePayment = relatedPayments && relatedPayments.length > 1
 
+    const receiptNumber = payment.id ? `REC-${payment.id.slice(0, 8).toUpperCase()}` : `REC-${Date.now()}`
+
     const receiptData = {
-      receiptNumber: `REC-${payment.id?.slice(0, 8).toUpperCase() || Date.now()}`,
+      receiptNumber,
       date: new Date().toLocaleDateString('fr-FR'),
       tenant: {
         firstName: payment.tenants?.first_name || '',
@@ -301,6 +312,7 @@ export default function PaymentsPage() {
       },
     }
 
+    const { downloadReceipt } = await import('@/hooks/useReceiptGenerator')
     await downloadReceipt(receiptData)
     setToast({ message: 'Reçu généré avec succès', type: 'success' })
   }
@@ -459,14 +471,14 @@ export default function PaymentsPage() {
       {/* Modal Ajout */}
       {showAddModal && (
         <Modal isOpen={showAddModal} onClose={() => setShowAddModal(false)}>
-          <PaymentForm contracts={contracts} onSubmit={handleAddPayment} onCancel={() => setShowAddModal(false)} />
+          <PaymentForm contracts={contracts} onSubmit={handleAddPayment} onCancel={() => setShowAddModal(false)} userId={currentUser?.id} />
         </Modal>
       )}
 
       {/* Modal Modification */}
       {showEditModal && selectedPayment && (
         <Modal isOpen={showEditModal} onClose={() => { setShowEditModal(false); setSelectedPayment(null) }}>
-          <PaymentForm contracts={contracts} initialData={selectedPayment} onSubmit={handleUpdatePayment} onCancel={() => { setShowEditModal(false); setSelectedPayment(null) }} />
+          <PaymentForm contracts={contracts} initialData={selectedPayment} onSubmit={handleUpdatePayment} onCancel={() => { setShowEditModal(false); setSelectedPayment(null) }} userId={currentUser?.id} />
         </Modal>
       )}
 
@@ -503,8 +515,9 @@ interface PaymentFormData {
   months_to_pay?: number
 }
 
-function PaymentForm({ contracts, initialData, onSubmit, onCancel }: {
+function PaymentForm({ contracts, initialData, onSubmit, onCancel, userId }: {
   contracts: (Contract & { properties?: Property; tenants?: Tenant; units?: Unit })[]
+  userId?: string
   initialData?: Partial<PaymentFormData>
   onSubmit: (data: PaymentFormData) => void
   onCancel: () => void
@@ -529,7 +542,7 @@ function PaymentForm({ contracts, initialData, onSubmit, onCancel }: {
   // Vérification en temps réel des doublons
   useEffect(() => {
     const checkDuplicates = async () => {
-      if (!formData.contract_id || !formData.tenant_id || !formData.due_date) {
+      if (!formData.contract_id || !formData.tenant_id || !formData.due_date || !userId) {
         setDuplicateMonths([])
         return
       }
@@ -545,17 +558,11 @@ function PaymentForm({ contracts, initialData, onSubmit, onCancel }: {
       const startDate = new Date(formData.due_date)
       const duplicates: string[] = []
 
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) {
-        setValidating(false)
-        return
-      }
-
       const { data: existingPayments } = await supabase
         .from('payments')
         .select('*, contracts(property_id)')
         .eq('tenant_id', formData.tenant_id)
-        .eq('user_id', user.id)
+        .eq('user_id', userId)
 
       if (existingPayments) {
         for (let i = 0; i < monthsToPay; i++) {
@@ -586,7 +593,7 @@ function PaymentForm({ contracts, initialData, onSubmit, onCancel }: {
     }
 
     checkDuplicates()
-  }, [formData.contract_id, formData.tenant_id, formData.due_date, formData.months_to_pay, contracts])
+  }, [formData.contract_id, formData.tenant_id, formData.due_date, formData.months_to_pay, contracts, userId])
 
   const validateForm = () => {
     const newErrors: Record<string, string> = {}

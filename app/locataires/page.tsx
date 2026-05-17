@@ -35,6 +35,7 @@ type TenantFormProps = {
 export default function TenantsPage() {
   const [tenants, setTenants] = useState<Tenant[]>([])
   const [loading, setLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<{ id: string } | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const [selectedTenant, setSelectedTenant] = useState<Tenant | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -52,6 +53,7 @@ export default function TenantsPage() {
       setLoading(false)
       return
     }
+    setCurrentUser(user)
 
     const { data } = await supabase
       .from('tenants')
@@ -71,7 +73,7 @@ export default function TenantsPage() {
   }, [loadTenants])
 
   const handleAddTenant = async (formData: TenantFormData) => {
-    const { data: { user } } = await supabase.auth.getUser()
+    const user = currentUser
     if (!user) return
 
     const { error } = await supabase

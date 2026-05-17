@@ -81,6 +81,7 @@ export default function DashboardPage() {
   const [recentPayments, setRecentPayments] = useState<RecentPayment[]>([])
   const [upcomingContracts, setUpcomingContracts] = useState<UpcomingContract[]>([])
   const [loading, setLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<{ id: string } | null>(null)
   const router = useRouter()
 
   const loadDashboardData = useCallback(async () => {
@@ -90,88 +91,46 @@ export default function DashboardPage() {
       setLoading(false)
       return
     }
+    setCurrentUser(user)
 
     try {
-      // Charger les propriétés
-      const { data: properties } = await supabase
-        .from('properties')
-        .select('*')
-        .eq('user_id', user.id)
-
-      // Charger les locataires
-      const { data: tenants } = await supabase
-        .from('tenants')
-        .select('*')
-        .eq('user_id', user.id)
-
-      // Charger les paiements du mois en cours
       const now = new Date()
       const monthStart = startOfMonth(now)
       const monthEnd = endOfMonth(now)
+      const thirtyDaysFromNow = addDays(now, 30)
 
-      const { data: monthlyPayments } = await supabase
-        .from('payments')
-        .select('amount, status')
-        .eq('user_id', user.id)
-        .eq('status', 'paid')
-        .gte('paid_date', monthStart.toISOString())
-        .lte('paid_date', monthEnd.toISOString())
+      const [
+        { data: properties },
+        { data: tenants },
+        { data: monthlyPayments },
+        { data: allPayments },
+        { data: overduePayments },
+        { data: activeContracts },
+        { data: recentPaymentsData },
+        { data: expiringContracts }
+      ] = await Promise.all([
+        supabase.from('properties').select('*').eq('user_id', user.id),
+        supabase.from('tenants').select('*').eq('user_id', user.id),
+        supabase.from('payments').select('amount, status').eq('user_id', user.id).eq('status', 'paid').gte('paid_date', monthStart.toISOString()).lte('paid_date', monthEnd.toISOString()),
+        supabase.from('payments').select('amount, status').eq('user_id', user.id).eq('status', 'paid'),
+        supabase.from('payments').select('id').eq('user_id', user.id).eq('status', 'pending').lt('due_date', now.toISOString()),
+        supabase.from('contracts').select('id').eq('user_id', user.id).eq('status', 'active'),
+        supabase.from('payments').select(`
+          id, amount, status, due_date, paid_date,
+          tenants!inner(first_name, last_name),
+          properties!inner(name, address)
+        `).eq('user_id', user.id).order('created_at', { ascending: false }).limit(5),
+        supabase.from('contracts').select(`
+          id, end_date,
+          properties!inner(name, address),
+          tenants!inner(first_name, last_name)
+        `).eq('user_id', user.id).eq('status', 'active').lte('end_date', thirtyDaysFromNow.toISOString()).order('end_date', { ascending: true }).limit(5)
+      ])
 
-      // Charger tous les paiements pour calculer le revenu total
-      const { data: allPayments } = await supabase
-        .from('payments')
-        .select('amount, status')
-        .eq('user_id', user.id)
-        .eq('status', 'paid')
-
-      // Charger les paiements en retard
-      const { data: overduePayments } = await supabase
-        .from('payments')
-        .select('id')
-        .eq('user_id', user.id)
-        .eq('status', 'pending')
-        .lt('due_date', now.toISOString())
-
-      // Charger les contrats actifs pour calculer le taux d'occupation
-      const { data: activeContracts } = await supabase
-        .from('contracts')
-        .select('id')
-        .eq('user_id', user.id)
-        .eq('status', 'active')
-
-      // Calculer le taux d'occupation
       const occupancyRate = properties && properties.length > 0
         ? Math.round((activeContracts?.length || 0) / properties.length * 100)
         : 0
 
-      // Charger les paiements récents avec relations
-      const { data: recentPaymentsData } = await supabase
-        .from('payments')
-        .select(`
-          id, amount, status, due_date, paid_date,
-          tenants!inner(first_name, last_name),
-          properties!inner(name, address)
-        `)
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false })
-        .limit(5)
-
-      // Charger les contrats qui expirent bientôt
-      const thirtyDaysFromNow = addDays(now, 30)
-      const { data: expiringContracts } = await supabase
-        .from('contracts')
-        .select(`
-          id, end_date,
-          properties!inner(name, address),
-          tenants!inner(first_name, last_name)
-        `)
-        .eq('user_id', user.id)
-        .eq('status', 'active')
-        .lte('end_date', thirtyDaysFromNow.toISOString())
-        .order('end_date', { ascending: true })
-        .limit(5)
-
-      // Calculer les statistiques
       const monthlyRevenue = monthlyPayments?.reduce((sum, p) => sum + p.amount, 0) || 0
       const totalRevenue = allPayments?.reduce((sum, p) => sum + p.amount, 0) || 0
 
@@ -184,7 +143,6 @@ export default function DashboardPage() {
         totalRevenue
       })
 
-      // Formater les paiements récents
       if (recentPaymentsData) {
         const formattedPayments: RecentPayment[] = (recentPaymentsData as SupabasePayment[]).map((payment) => ({
           id: payment.id,
@@ -198,7 +156,6 @@ export default function DashboardPage() {
         setRecentPayments(formattedPayments)
       }
 
-      // Formater les contrats expirants
       if (expiringContracts) {
         const formattedContracts: UpcomingContract[] = (expiringContracts as SupabaseContract[]).map((contract) => ({
           id: contract.id,

@@ -37,6 +37,7 @@ type PropertyFormProps = {
 export default function PropertiesPage() {
   const [properties, setProperties] = useState<Property[]>([])
   const [loading, setLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<{ id: string } | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const [selectedProperty, setSelectedProperty] = useState<Property | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -55,6 +56,7 @@ export default function PropertiesPage() {
       setLoading(false)
       return
     }
+    setCurrentUser(user)
 
     const { data } = await supabase
       .from('properties')
@@ -74,7 +76,7 @@ export default function PropertiesPage() {
   }, [loadProperties])
 
   const handleAddProperty = async (formData: PropertyFormData) => {
-    const { data: { user } } = await supabase.auth.getUser()
+    const user = currentUser
     if (!user) return
 
     const { error } = await supabase
